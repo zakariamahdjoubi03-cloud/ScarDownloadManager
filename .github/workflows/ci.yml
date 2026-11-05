@@ -1,0 +1,235 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Detects what exists in the repository. Build and test jobs activate
+  # automatically as soon as the corresponding stack lands (Phase 1).
+  # Until then they are skipped, so a docs-only PR can be green.
+  # ---------------------------------------------------------------------------
+  detect:
+    name: Detect stack
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.detect.outputs.rust }}
+      web: ${{ steps.detect.outputs.web }}
+      tauri: ${{ steps.detect.outputs.tauri }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: detect
+        name: Detect project files
+        run: |
+          set -euo pipefail
+          echo "rust=$([ -f src-tauri/Cargo.toml ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "web=$([ -f package.json ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "tauri=$([ -f src-tauri/tauri.conf.json ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # Documentation gate: runs on every PR, including the foundation PR.
+  # ---------------------------------------------------------------------------
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Required foundation files
+        run: |
+          set -euo pipefail
+          required="README.md AGENTS.md docs/PRD.md docs/ARCHITECTURE.md docs/ROADMAP.md docs/adr/0001-tech-stack.md docs/adr/0002-i18n-strategy.md docs/adr/0003-data-storage.md docs/adr/0004-license.md docs/adr/0005-video-download-strategy.md docs/adr/0006-distribution-and-updates.md .github/workflows/ci.yml"
+          missing=0
+          for f in $required; do
+            if [ ! -s "$f" ]; then
+              echo "::error file=$f::Missing or empty required file: $f"
+              missing=1
+            fi
+          done
+          exit $missing
+
+      - name: ADR status headers
+        run: |
+          set -euo pipefail
+          # ADR files are numbered; the index (README.md) is exempt.
+          for f in docs/adr/[0-9]*.md; do
+            grep -qi '^\*\*Status' "$f" || { echo "::error file=$f::ADR is missing a Status line"; exit 1; }
+          done
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Markdown lint
+        run: npx --yes markdownlint-cli2 "**/*.md" "#node_modules"
+
+  # ---------------------------------------------------------------------------
+  # Rust: format, lint, test on all three operating systems.
+  # ---------------------------------------------------------------------------
+  rust:
+    name: Rust (${{ matrix.os }})
+    needs: detect
+    if: needs.detect.outputs.rust == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies (Tauri)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libxdo-dev \
+            libssl-dev \
+            build-essential \
+            curl wget file
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Format
+        working-directory: src-tauri
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        working-directory: src-tauri
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Tests
+        working-directory: src-tauri
+        run: cargo test --all-features --locked
+
+  # ---------------------------------------------------------------------------
+  # Frontend: install, lint, typecheck, test.
+  # ---------------------------------------------------------------------------
+  web:
+    name: Web
+    needs: detect
+    if: needs.detect.outputs.web == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          if [ -f pnpm-lock.yaml ]; then
+            corepack enable
+            pnpm install --frozen-lockfile
+          elif [ -f yarn.lock ]; then
+            corepack enable
+            yarn install --immutable
+          else
+            npm ci
+          fi
+
+      - name: Lint
+        run: |
+          if [ -f pnpm-lock.yaml ]; then pnpm run --if-present lint
+          elif [ -f yarn.lock ]; then yarn run --if-present lint
+          else npm run --if-present lint
+          fi
+
+      - name: Typecheck
+        run: |
+          if [ -f pnpm-lock.yaml ]; then pnpm run --if-present typecheck
+          elif [ -f yarn.lock ]; then yarn run --if-present typecheck
+          else npm run --if-present typecheck
+          fi
+
+      - name: Unit tests
+        run: |
+          if [ -f pnpm-lock.yaml ]; then pnpm run --if-present test
+          elif [ -f yarn.lock ]; then yarn run --if-present test
+          else npm run --if-present test
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Tauri: bundle the desktop app on all three operating systems.
+  # ---------------------------------------------------------------------------
+  tauri:
+    name: Tauri build (${{ matrix.os }})
+    needs: detect
+    if: needs.detect.outputs.tauri == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libxdo-dev \
+            libssl-dev \
+            build-essential \
+            curl wget file
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: |
+          set -euo pipefail
+          if [ -f pnpm-lock.yaml ]; then
+            corepack enable
+            pnpm install --frozen-lockfile
+          elif [ -f yarn.lock ]; then
+            corepack enable
+            yarn install --immutable
+          else
+            npm ci
+          fi
+
+      - name: Build (no bundle, artifacts are release-only)
+        run: |
+          if [ -f pnpm-lock.yaml ]; then pnpm run --if-present tauri -- build --no-bundle
+          elif [ -f yarn.lock ]; then yarn run --if-present tauri -- build --no-bundle
+          else npm run --if-present tauri -- build --no-bundle
+          fi
