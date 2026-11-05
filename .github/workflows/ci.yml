@@ -65,7 +65,8 @@ jobs:
       - name: ADR status headers
         run: |
           set -euo pipefail
-          for f in docs/adr/*.md; do
+          # ADR files are numbered; the index (README.md) is exempt.
+          for f in docs/adr/[0-9]*.md; do
             grep -qi '^\*\*Status' "$f" || { echo "::error file=$f::ADR is missing a Status line"; exit 1; }
           done
 
